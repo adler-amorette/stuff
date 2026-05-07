@@ -1,0 +1,223 @@
+
+I know pretty much nothing about anything related(Tor, networking, security).
+
+This was written primarily for myself,
+as I did not find a good existing post on the subject,
+thus decided to write up what I had learned.
+
+Most things are explained,
+the rest is considered self-explanatory or out of scope.
+
+This shouldn't require any special knowledge to understand,
+given this is exactly what you want to do.
+
+It's recommended you first read the whole thing (files too),
+and only then start going step by step.
+
+If any instructions conflict with your existing setup, adjust accordingly.
+
+
+How this will work
+--------------------------------------
+
+Normally, Tor is used as a SOCKS proxy (which gets enabled by default).
+But we need to make sure that all traffic on a VM goes through Tor,
+which means having to proxy raw packets.
+"all traffic" means TCP and DNS(UPD on port 53), because it's all Tor can handle.
+So anything that's not TCP won't work, the packets will be dropped.
+Anything P2P won't work either.
+
+Tor will be configured to handle TCP and DNS packets.
+A VM will be connected to a virtual network, the host OS will be the VM's gateway.
+Using `iptables`, virtual interface's TCP and DNS packets will be redirected to Tor.
+
+
+Configuring VirtualBox
+--------------------------------------
+
+It's assumed you have no existing "host-only" networks.
+To check, go to the VirtualBox Manager,
+File->Tools->Network Manager, "Host-only Networks" tab,
+and if any exist, remove them.
+
+Run the following commands (non-root):
+```
+VBoxManage hostonlyif create
+VBoxManage dhcpserver add --ifname vboxnet0 \
+	--ip 192.168.56.100 \
+	--netmask 255.255.255.0 \
+	--lowerip 192.168.56.101 \
+	--upperip 192.168.56.254 \
+	--set-opt 3 192.168.56.1 \
+	--set-opt 6 192.168.56.1 \
+	--enable
+```
+You can skip the second command (dhcpserver), but you'll have to configure the network
+on your guest OS manually, i.e. set static IP, gateway IP, network mask, DNS server IP.
+
+The first command creates `vboxnet0`.
+
+The second command creates a DHCP server for the virtual network.
+`--lowerip` and `--upperip` specify the range that can be used to assign IPs,
+the remaining IPs are used for manual/static assignment.
+`--set-opt 3` and `--set-opt 6` specify gateway and DNS server IP,
+by default they are not set.
+`--enable` is needed because by default the server is disabled.
+
+It is possible to create a DHCP server with a single click.
+In File->Tools->Network Manager, select vboxnet0,
+in "DHCP Server" tab there's a checkbox "Enable Server".
+But you'd still have to specify gateway and DNS server IP, which is impossible in GUI.
+
+FINALLY... Go to your VM's Settings->Network.
+Set "Attached to" to "Host-only Adapter".
+Set "Name" to "vboxnet0".
+
+At this point you can start the VM, if you want.
+Remaining steps can be done with it running.
+
+Make sure the guest OS has network configured,
+i.e. has its own IP, gateway IP, DNS server IP.
+
+
+Configuring Tor
+--------------------------------------
+
+Below are the contents for `/etc/tor/torrc`.
+If you don't want to modify the global Tor config, use the `-f` flag for `tor`.
+You'll only have to modify the bridges section, or remove it altogether.
+Save the file, and start Tor (run `tor`, non-root).
+Look at the output, make sure there are no warnings (marked as "[warn]"),
+it should print "[notice] Bootstrapped 100% (done): Done".
+
+You can run `curl --socks5-hostname 192.168.56.1:9051 ifconfig.me`
+to be absolutely sure that Tor works.
+
+
+Configuring routing
+--------------------------------------
+
+Below are the contents for `reroute.sh`.
+If you changed TCP or DNS ports in `/etc/tor/torrc`, change `reroute.sh` accordingly.
+Run `sh reroute.sh` as root, it should print "DONE".
+
+
+DONE. Ready to use.
+
+
+Another possible setup: Tor listening on localhost
+--------------------------------------
+
+Useful if you want to use your existing Tor service for some reason.
+
+In `/etc/tor/torrc` remove the IP from all ports like so `TransPort 9052`.
+When specifying just the port, the IP will be `127.0.0.1`.
+
+Instead of `reroute.sh` use `reroute_local.sh`.
+
+`reroute_local.sh` contains an optional section that restricts incoming `vboxnet0` traffic.
+Without those restrictions it's possible for the VM to send
+UDP and ICMP packets to localhost (due to enabling `route_localnet`).
+Such packets can be sent by manually crafting them
+(with dest_MAC=<host>, dest_IP=<localhost>), which requires privileges.
+
+
+------------------------------------------------------------------------------
+/etc/tor/torrc
+------------------------------------------------------------------------------
+
+# -------------- OPTIONAL
+
+# SOCKS proxy to maybe use locally, or check that Tor works.
+# If you want to disable this, need to specify `0`,
+# because it gets enabled by default (with `9050`).
+SocksPort 192.168.56.1:9051
+
+# -------------- REQUIRED
+
+# TCP proxy
+TransPort 192.168.56.1:9052
+
+# DNS proxy, separate because DNS is over UDP
+DNSPort 192.168.56.1:9053
+
+# -------------- OPTIONAL: for .onion sites to work
+
+# Tells Tor to map .onion and .exit names
+# to virtual addresses, otherwise Tor's DNS won't resolve them.
+AutomapHostsOnResolve 1
+
+# Specifies the range to be used for virtual addresses.
+# It can be any unused private range that is big enough.
+# We need to specify this because by default
+# the range is 127.192.0.0/10, which is in the loopback range,
+# which means packets destined to those addresses won't leave the VM.
+VirtualAddrNetworkIPv4 10.192.0.0/10
+
+# -------------- OPTIONAL: bridges (when Tor gets blocked)
+
+UseBridges 1
+
+# Needed for obfs4 bridges.
+# For other(non-obfs4) bridges change accordingly.
+ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
+
+# Example bridges, you'll need get your own (e.g. copy from TorBrowser)
+Bridge obfs4 117.151.14.111:9130 111111111119D3BD6FD91E0E49EE2A155F446D77 cert=xcXKVEOGaUAxpF8vcdC1111111111UWQrTWgrPFZ+u1S724j+FBmxZaO+atlOvWbXc6fFA iat-mode=0
+Bridge obfs4 14.11.17.110:8080 8415C052F2E8F7F16E0ED111111111B69500E33C cert=Yip5OKwT/BY8xx29fFneHaN3TeDvzxQtNBqcwSmTcqxk5w51F11111111XhrxNi0nugbGw iat-mode=0
+
+------------------------------------------------------------------------------
+reroute.sh
+------------------------------------------------------------------------------
+
+# Exit on error
+set -e
+
+TOR_TCP="9052"
+TOR_DNS="9053"
+
+# Clear existing NAT rules
+iptables -t nat -F
+
+preroute="iptables -t nat -A PREROUTING -i vboxnet0"
+$preroute -p udp --dport 53 -j REDIRECT --to-ports $TOR_DNS
+$preroute -p tcp            -j REDIRECT --to-ports $TOR_TCP
+
+echo DONE
+
+------------------------------------------------------------------------------
+reroute_local.sh
+------------------------------------------------------------------------------
+
+# Exit on error
+set -e
+
+TOR_TCP="9052"
+TOR_DNS="9053"
+
+# Allow vboxnet0 packets to be sent to 127.0.0.1
+echo 1 > /proc/sys/net/ipv4/conf/vboxnet0/route_localnet
+
+# Clear existing NAT rules
+iptables -t nat -F
+
+preroute="iptables -t nat -A PREROUTING -i vboxnet0"
+$preroute -p udp --dport 53 -j DNAT --to-destination 127.0.0.1:$TOR_DNS
+$preroute -p tcp            -j DNAT --to-destination 127.0.0.1:$TOR_TCP
+
+# -------------- OPTIONAL: allow only redirected traffic
+
+# Clear existing "filter"(it's the default table) rules
+iptables -F
+
+# Allow only
+iptables -A INPUT -i vboxnet0 -p udp -d 127.0.0.1 --dport $TOR_DNS -j ACCEPT
+iptables -A INPUT -i vboxnet0 -p tcp -d 127.0.0.1 --dport $TOR_TCP -j ACCEPT
+
+# Drop everything else
+iptables -A INPUT -i vboxnet0 -j DROP
+
+echo DONE
+
+------------------------------------------------------------------------------
+
